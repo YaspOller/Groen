@@ -1,0 +1,34 @@
+name: Grøn Koncert Aarhus Resale Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hent kode
+        uses: actions/checkout@v4
+      
+      - name: Opsæt Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          
+      - name: Installer pakker
+        run: pip install -r requirements.txt
+        
+      - name: Kør overvågning
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python monitor.py
+        
+      - name: Gem ændringer (state.json)
+        run: |
+          git config --global user.name "Billet-Bot"
+          git config --global user.email "bot@example.com"
+          git add data/state.json
+          git commit -m "Opdateret state.json" || exit 0
+          git push
