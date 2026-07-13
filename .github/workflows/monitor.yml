@@ -20,6 +20,9 @@ jobs:
       - name: Installer pakker
         run: pip install -r requirements.txt
         
+      - name: Installer usynlig browser (Playwright)
+        run: playwright install chromium --with-deps
+        
       - name: Kør overvågning
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
