@@ -6,6 +6,7 @@ import time
 import json
 from datetime import datetime, timezone
 import requests
+from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 CITY = "Aarhus"
@@ -47,12 +48,18 @@ def send_discord_message(content: str) -> None:
 def check_once(state: dict, context) -> dict:
     page = context.new_page()
     try:
-        log(f"Åbner Grøn Koncert siden for at finde linket til {CITY}...")
+        log(f"Åbner browser og tjekker {CITY}...")
         page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
         
-        # FINDER LINKET I STEDET FOR BARE AT KLIKKE:
-        ticket_url = page.evaluate('''() => {
-            let links = Array.from(document.querySelectorAll("a"));
+        # 1. Klik cookie-boks væk
+        try:
+            page.locator("button, a", has_text=re.compile(r"accepter|tillad", re.I)).first.click(timeout=2000)
+        except:
+            pass
+            
+        # 2. Finder og KLIKKER på knappen
+        clicked = page.evaluate('''() => {
+            let links = Array.from(document.querySelectorAll("a, button"));
             for (let link of links) {
                 let txt = (link.innerText || "").toLowerCase();
                 if (txt.includes("køb") || txt.includes("resale") || txt.includes("venteliste")) {
@@ -61,33 +68,39 @@ def check_once(state: dict, context) -> dict:
                         if (parent && parent.innerText) {
                             let pText = parent.innerText;
                             if (pText.includes("Aarhus") && !pText.includes("Aalborg") && !pText.includes("Kolding")) {
-                                return link.href; // Returnerer den direkte URL
+                                link.click();
+                                return true;
                             }
                         }
                         if(parent) parent = parent.parentElement;
                     }
                 }
             }
-            return null;
+            return false;
         }''')
         
-        if not ticket_url:
-            log("Kunne slet ikke finde billet-linket for Aarhus på siden!")
+        if not clicked:
+            log("Kunne slet ikke finde billet-knappen for Aarhus at klikke på!")
             page.close()
             return state
             
-        log(f"Fandt direkte link: {ticket_url}")
-        log("Går direkte til billet-systemet...")
+        log("Fandt Aarhus-knappen og klikkede på den! Venter 10 sek. på at pop-up koden hentes...")
         
-        # GÅR DIREKTE TIL BILLETSYSTEMET (Billetten.dk):
-        page.goto(ticket_url, wait_until="networkidle", timeout=30000)
+        # 3. Vent på pop-up / iframe
+        page.wait_for_timeout(10000) 
         
-        # Vent 3 sekunder ekstra for at eventuelle asynkrone tekster i billetsystemet kan loade
-        page.wait_for_timeout(3000)
-        
-        # Læser al tekst på den nye side (billetsystemet)
-        full_text = page.inner_text("body")
-        full_text = re.sub(r"\s+", " ", full_text).strip().lower()
+        # 4. Hent RÅ KODE fra hovedsiden OG alle indlejrede pop-ups/iframes
+        raw_html = page.content()
+        for frame in page.frames:
+            try:
+                raw_html += " " + frame.content()
+            except:
+                pass
+                
+        # 5. Brug BeautifulSoup til at rense al HTML-kode væk og kun beholde teksten
+        soup = BeautifulSoup(raw_html, "html.parser")
+        full_text = soup.get_text(" ").lower()
+        full_text = re.sub(r"\s+", " ", full_text).strip()
         
     except Exception as e:
         log(f"Fejl under browser-tjek: {e}")
@@ -96,7 +109,7 @@ def check_once(state: dict, context) -> dict:
         
     page.close()
     
-    # 5. Analysér teksten FRA BILLETSYSTEMET
+    # 6. Analysér teksten
     no_tickets_phrase = "ingen resalebilletter tilgængeligt pt"
     
     if no_tickets_phrase in full_text:
@@ -107,8 +120,9 @@ def check_once(state: dict, context) -> dict:
         reason = "Positiv tekst fundet (fx 'billet ledig')."
     else:
         currently_available = True
-        reason = "Udsolgt-teksten er IKKE på billetsiden! Mulig billet."
-        log(f"-> Robotten ser dette på BILLETSIDEN (uddrag): {full_text[:300]}...")
+        reason = "Udsolgt-teksten er IKKE fundet i pop-up'en! Mulig billet."
+        # Nu vil den printe alt teksten på siden for at vi kan se om den faktisk får fat i pop-up teksten
+        log(f"-> Robotten ser nu denne tekst i alt: {full_text[:300]}...")
         
     previous_available = state.get("available")
     
