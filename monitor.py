@@ -6,7 +6,6 @@ import time
 import json
 from datetime import datetime, timezone
 import requests
-from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 CITY = "Aarhus"
@@ -48,16 +47,25 @@ def send_discord_message(content: str) -> None:
 def check_once(state: dict, context) -> dict:
     page = context.new_page()
     try:
-        log(f"Åbner browser og tjekker {CITY}...")
-        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+        log(f"Åbner Grøn Koncert for at tjekke {CITY}...")
+        page.goto(TARGET_URL, wait_until="networkidle", timeout=30000)
         
-        # 1. Klik cookie-boks væk
-        try:
-            page.locator("button, a", has_text=re.compile(r"accepter|tillad", re.I)).first.click(timeout=2000)
-        except:
-            pass
+        # 1. AGGRESSIVT KLIK PÅ COOKIE-BANNER
+        # Vi leder efter alle knapper der kunne være accept-cookies
+        cookie_buttons = page.locator("button, a")
+        for i in range(cookie_buttons.count()):
+            btn = cookie_buttons.nth(i)
+            try:
+                txt = btn.inner_text().lower()
+                if any(word in txt for word in ["accept", "tillad", "okay", "godkend"]):
+                    btn.click(timeout=1000)
+                    log("Cookie-banner fjernet!")
+                    page.wait_for_timeout(1000) # Vent lige lidt efter klik
+                    break
+            except:
+                continue
             
-        # 2. Finder og KLIKKER på knappen
+        # 2. Find Aarhus-knappen og klik
         clicked = page.evaluate('''() => {
             let links = Array.from(document.querySelectorAll("a, button"));
             for (let link of links) {
@@ -65,14 +73,11 @@ def check_once(state: dict, context) -> dict:
                 if (txt.includes("køb") || txt.includes("resale") || txt.includes("venteliste")) {
                     let parent = link.parentElement;
                     for(let i=0; i<8; i++) {
-                        if (parent && parent.innerText) {
-                            let pText = parent.innerText;
-                            if (pText.includes("Aarhus") && !pText.includes("Aalborg") && !pText.includes("Kolding")) {
-                                link.click();
-                                return true;
-                            }
+                        if (parent && parent.innerText && parent.innerText.includes("Aarhus") && !parent.innerText.includes("Aalborg")) {
+                            link.click();
+                            return true;
                         }
-                        if(parent) parent = parent.parentElement;
+                        parent = parent.parentElement;
                     }
                 }
             }
@@ -80,62 +85,57 @@ def check_once(state: dict, context) -> dict:
         }''')
         
         if not clicked:
-            log("Kunne slet ikke finde billet-knappen for Aarhus at klikke på!")
-            page.close()
-            return state
-            
-        log("Fandt Aarhus-knappen og klikkede på den! Venter 10 sek. på at pop-up koden hentes...")
+            log("Kunne ikke klikke på knappen!")
+        else:
+            log("Klikket! Venter 10 sek. på at billetsystemet loader ind...")
         
-        # 3. Vent på pop-up / iframe
         page.wait_for_timeout(10000) 
         
-        # 4. Hent RÅ KODE fra hovedsiden OG alle indlejrede pop-ups/iframes
-        raw_html = page.content()
+        # 3. Læs ALT tekst på siden igen
+        full_text = page.inner_text("body").lower()
+        # Tjek også frames/popups specifikt
         for frame in page.frames:
             try:
-                raw_html += " " + frame.content()
+                full_text += " " + frame.inner_text("body").lower()
             except:
                 pass
                 
-        # 5. Brug BeautifulSoup til at rense al HTML-kode væk og kun beholde teksten
-        soup = BeautifulSoup(raw_html, "html.parser")
-        full_text = soup.get_text(" ").lower()
         full_text = re.sub(r"\s+", " ", full_text).strip()
         
     except Exception as e:
-        log(f"Fejl under browser-tjek: {e}")
+        log(f"Fejl: {e}")
         page.close()
         return state
         
     page.close()
     
-    # 6. Analysér teksten
+    # 4. Analysér
     no_tickets_phrase = "ingen resalebilletter tilgængeligt pt"
     
-    if no_tickets_phrase in full_text:
+    # Her tjekker vi for "ingen" ELLER "udsolgt" som sikkerhed
+    if no_tickets_phrase in full_text or "udsolgt" in full_text:
         currently_available = False
-        reason = "Ingen billetter (Udsolgt-tekst fundet)."
+        reason = "Udsolgt-tekst fundet."
     elif "billet ledig" in full_text or "billetter ledig" in full_text or re.search(r"\b[1-9]\d*\s*billet", full_text):
         currently_available = True
         reason = "Positiv tekst fundet (fx 'billet ledig')."
     else:
-        currently_available = True
-        reason = "Udsolgt-teksten er IKKE fundet i pop-up'en! Mulig billet."
-        # Nu vil den printe alt teksten på siden for at vi kan se om den faktisk får fat i pop-up teksten
-        log(f"-> Robotten ser nu denne tekst i alt: {full_text[:300]}...")
+        # Hvis vi IKKE finder udsolgt-teksten, og heller ikke "billet ledig", 
+        # er det stadig usikkert - vi gemmer uddraget til dig.
+        currently_available = False 
+        log(f"-> Robotten ser stadig dette (uddrag): {full_text[:300]}...")
+        reason = "Systemet viser hverken 'udsolgt' eller 'ledig' - mulig fejl."
         
     previous_available = state.get("available")
     
     if previous_available is None:
-        log(f"Første kørsel - gemmer status: {reason}")
         state["available"] = currently_available
         return state
 
     if currently_available and not previous_available:
-        msg = f"🎟️ **BILLETTER TILGÆNGELIGE TIL {CITY.upper()}!** 🎟️\n**Årsag:** {reason}\nKøb her: {TARGET_URL}"
-        send_discord_message(msg)
+        send_discord_message(f"🎟️ **BILLETTER TIL {CITY.upper()}!**\nSkynd dig: {TARGET_URL}")
     elif not currently_available and previous_available:
-        send_discord_message(f"ℹ️ Billetter til **{CITY}** er væk igen. ({reason})")
+        send_discord_message(f"ℹ️ Billetter til **{CITY}** er væk/ikke fundet.")
     else:
         log(f"Status uændret: {reason}")
         
@@ -148,10 +148,7 @@ def main():
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            locale="da-DK"
-        )
+        context = browser.new_context(user_agent="Mozilla/5.0", locale="da-DK")
         
         while True:
             state = check_once(state, context)
@@ -159,7 +156,6 @@ def main():
             if (time.monotonic() - start_time) + CHECK_INTERVAL_SECONDS >= RUN_DURATION_SECONDS:
                 break
             time.sleep(CHECK_INTERVAL_SECONDS)
-            
         browser.close()
 
 if __name__ == "__main__":
