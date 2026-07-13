@@ -15,7 +15,7 @@ STATE_FILE = os.path.join(os.path.dirname(__file__), "data", "state.json")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
 RUN_DURATION_SECONDS = 260
-CHECK_INTERVAL_SECONDS = 30  # Tjekker hvert halve minut nu
+CHECK_INTERVAL_SECONDS = 30  # Tjekker hvert halve minut
 
 def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -50,44 +50,46 @@ def check_once(state: dict, context) -> dict:
         log(f"Åbner browser og tjekker {CITY}...")
         page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
         
-        # 1. Klik cookie-boks væk, hvis den er i vejen
+        # 1. Klik cookie-boks væk, hvis den er der
         try:
             page.locator("button, a", has_text=re.compile(r"accepter|tillad", re.I)).first.click(timeout=2000)
         except:
             pass
             
-        # 2. Find "Aarhus" på siden, og klik på den tilhørende billet-knap
-        page.evaluate('''() => {
-            let els = document.querySelectorAll("h2, h3, h4, span, div, p");
-            let aarhusEl = Array.from(els).find(e => e.innerText && e.innerText.trim() === "Aarhus");
-            if (aarhusEl) {
-                aarhusEl.click(); 
-                let parent = aarhusEl.parentElement;
-                while(parent && parent.tagName !== "BODY") {
-                    let btns = parent.querySelectorAll("a, button");
+        # 2. Find den RIGTIGE Aarhus-sektion og klik på knappen
+        clicked = page.evaluate('''() => {
+            let containers = document.querySelectorAll("div, section");
+            for (let c of containers) {
+                let h = c.querySelector("h2, h3, h4");
+                // Tjekker at vi er ved overskriften for byen
+                if (h && h.innerText.trim() === "Aarhus") {
+                    let btns = c.querySelectorAll("a, button");
                     for (let btn of btns) {
                         let txt = btn.innerText.toLowerCase();
-                        if(txt.includes("resale") || txt.includes("venteliste") || txt.includes("køb")) {
+                        if (txt.includes("køb") || txt.includes("resale") || txt.includes("venteliste")) {
                             btn.click();
-                            return;
+                            return true;
                         }
                     }
-                    parent = parent.parentElement;
                 }
             }
+            return false;
         }''')
         
-        # 3. Vent 6 sekunder på at pop-up'en loader færdig
-        page.wait_for_timeout(6000) 
+        if not clicked:
+            log("Kunne slet ikke finde billet-knappen for Aarhus at klikke på!")
+        
+        # 3. Vent lidt længere (10 sekunder) for at være sikker på at pop-up/billetsystem loader
+        page.wait_for_timeout(10000) 
         
         full_text = ""
-        # 4. Saml tekst fra ALLE åbne vinduer og pop-ups for at være sikker
+        # 4. Saml alt tekst fra skærmen (inklusive iframes fra billetsystemet)
         for p in context.pages:
             try:
-                full_text += " " + p.inner_text("body")
+                full_text += " " + p.inner_text("body", timeout=2000)
                 for frame in p.frames:
                     try:
-                        full_text += " " + frame.locator("body").inner_text()
+                        full_text += " " + frame.locator("body").inner_text(timeout=2000)
                     except:
                         pass
             except:
@@ -102,7 +104,7 @@ def check_once(state: dict, context) -> dict:
         
     page.close()
     
-    # 5. Analysér den tekst, som browseren kan se
+    # 5. Analysér teksten
     no_tickets_phrase = "ingen resalebilletter tilgængeligt pt"
     
     if no_tickets_phrase in full_text:
@@ -113,7 +115,9 @@ def check_once(state: dict, context) -> dict:
         reason = "Positiv tekst fundet (fx 'billet ledig')."
     else:
         currently_available = True
-        reason = f"Udsolgt-teksten er forsvundet! Mulig billet til {CITY}."
+        reason = "Udsolgt-teksten er forsvundet! Mulig billet."
+        # NYT: Skriver de første 200 tegn af det robotten kan se, så vi kan fejlfinde
+        log(f"-> Robotten ser dette på skærmen (uddrag): {full_text[:200]}...")
         
     previous_available = state.get("available")
     
@@ -122,7 +126,6 @@ def check_once(state: dict, context) -> dict:
         state["available"] = currently_available
         return state
 
-    # 6. Giv lyd hvis status ændrer sig!
     if currently_available and not previous_available:
         msg = f"🎟️ **BILLETTER TILGÆNGELIGE TIL {CITY.upper()}!** 🎟️\n**Årsag:** {reason}\nKøb her: {TARGET_URL}"
         send_discord_message(msg)
@@ -138,7 +141,6 @@ def main():
     state = load_state()
     start_time = time.monotonic()
     
-    # Starter den usynlige browser én gang
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -146,7 +148,6 @@ def main():
             locale="da-DK"
         )
         
-        # Kører i loop til GitHub-kørslen udløber
         while True:
             state = check_once(state, context)
             save_state(state)
