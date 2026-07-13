@@ -50,26 +50,30 @@ def check_once(state: dict, context) -> dict:
         log(f"Åbner browser og tjekker {CITY}...")
         page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
         
-        # 1. Klik cookie-boks væk, hvis den er der
+        # 1. Klik cookie-boks væk, hvis den er i vejen
         try:
             page.locator("button, a", has_text=re.compile(r"accepter|tillad", re.I)).first.click(timeout=2000)
         except:
             pass
             
-        # 2. Find den RIGTIGE Aarhus-sektion og klik på knappen
+        # 2. SUPER-SØGEMASKINE TIL AT FINDE KNAPPEN:
         clicked = page.evaluate('''() => {
-            let containers = document.querySelectorAll("div, section");
-            for (let c of containers) {
-                let h = c.querySelector("h2, h3, h4");
-                // Tjekker at vi er ved overskriften for byen
-                if (h && h.innerText.trim() === "Aarhus") {
-                    let btns = c.querySelectorAll("a, button");
-                    for (let btn of btns) {
-                        let txt = btn.innerText.toLowerCase();
-                        if (txt.includes("køb") || txt.includes("resale") || txt.includes("venteliste")) {
-                            btn.click();
-                            return true;
+            let links = Array.from(document.querySelectorAll("a, button"));
+            for (let link of links) {
+                let txt = (link.innerText || "").toLowerCase();
+                if (txt.includes("køb") || txt.includes("resale") || txt.includes("venteliste")) {
+                    let parent = link.parentElement;
+                    // Gå op til 8 niveauer op for at finde "kassen"
+                    for(let i=0; i<8; i++) {
+                        if (parent && parent.innerText) {
+                            let pText = parent.innerText;
+                            // Tjek om vi er i Aarhus' kasse, og IKKE har fået nabo-byerne med
+                            if (pText.includes("Aarhus") && !pText.includes("Aalborg") && !pText.includes("Kolding")) {
+                                link.click();
+                                return true;
+                            }
                         }
+                        if(parent) parent = parent.parentElement;
                     }
                 }
             }
@@ -78,12 +82,14 @@ def check_once(state: dict, context) -> dict:
         
         if not clicked:
             log("Kunne slet ikke finde billet-knappen for Aarhus at klikke på!")
+        else:
+            log("Fandt Aarhus-knappen og klikkede på den! Venter 10 sekunder på pop-up...")
         
-        # 3. Vent lidt længere (10 sekunder) for at være sikker på at pop-up/billetsystem loader
+        # 3. Vent 10 sekunder for at pop-up/billetsystem loader 100%
         page.wait_for_timeout(10000) 
         
         full_text = ""
-        # 4. Saml alt tekst fra skærmen (inklusive iframes fra billetsystemet)
+        # 4. Saml alt tekst fra skærmen (inklusive det indlejrede billetsystem)
         for p in context.pages:
             try:
                 full_text += " " + p.inner_text("body", timeout=2000)
@@ -116,8 +122,7 @@ def check_once(state: dict, context) -> dict:
     else:
         currently_available = True
         reason = "Udsolgt-teksten er forsvundet! Mulig billet."
-        # NYT: Skriver de første 200 tegn af det robotten kan se, så vi kan fejlfinde
-        log(f"-> Robotten ser dette på skærmen (uddrag): {full_text[:200]}...")
+        log(f"-> Robotten ser dette på skærmen (uddrag): {full_text[:300]}...")
         
     previous_available = state.get("available")
     
