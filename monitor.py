@@ -15,7 +15,7 @@ STATE_FILE = os.path.join(os.path.dirname(__file__), "data", "state.json")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
 RUN_DURATION_SECONDS = 260
-CHECK_INTERVAL_SECONDS = 30  # Tjekker hvert halve minut
+CHECK_INTERVAL_SECONDS = 30 
 
 def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -47,60 +47,46 @@ def send_discord_message(content: str) -> None:
 def check_once(state: dict, context) -> dict:
     page = context.new_page()
     try:
-        log(f"Åbner browser og tjekker {CITY}...")
+        log(f"Åbner Grøn Koncert siden for at finde linket til {CITY}...")
         page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
         
-        # 1. Klik cookie-boks væk, hvis den er i vejen
-        try:
-            page.locator("button, a", has_text=re.compile(r"accepter|tillad", re.I)).first.click(timeout=2000)
-        except:
-            pass
-            
-        # 2. SUPER-SØGEMASKINE TIL AT FINDE KNAPPEN:
-        clicked = page.evaluate('''() => {
-            let links = Array.from(document.querySelectorAll("a, button"));
+        # FINDER LINKET I STEDET FOR BARE AT KLIKKE:
+        ticket_url = page.evaluate('''() => {
+            let links = Array.from(document.querySelectorAll("a"));
             for (let link of links) {
                 let txt = (link.innerText || "").toLowerCase();
                 if (txt.includes("køb") || txt.includes("resale") || txt.includes("venteliste")) {
                     let parent = link.parentElement;
-                    // Gå op til 8 niveauer op for at finde "kassen"
                     for(let i=0; i<8; i++) {
                         if (parent && parent.innerText) {
                             let pText = parent.innerText;
-                            // Tjek om vi er i Aarhus' kasse, og IKKE har fået nabo-byerne med
                             if (pText.includes("Aarhus") && !pText.includes("Aalborg") && !pText.includes("Kolding")) {
-                                link.click();
-                                return true;
+                                return link.href; // Returnerer den direkte URL
                             }
                         }
                         if(parent) parent = parent.parentElement;
                     }
                 }
             }
-            return false;
+            return null;
         }''')
         
-        if not clicked:
-            log("Kunne slet ikke finde billet-knappen for Aarhus at klikke på!")
-        else:
-            log("Fandt Aarhus-knappen og klikkede på den! Venter 10 sekunder på pop-up...")
+        if not ticket_url:
+            log("Kunne slet ikke finde billet-linket for Aarhus på siden!")
+            page.close()
+            return state
+            
+        log(f"Fandt direkte link: {ticket_url}")
+        log("Går direkte til billet-systemet...")
         
-        # 3. Vent 10 sekunder for at pop-up/billetsystem loader 100%
-        page.wait_for_timeout(10000) 
+        # GÅR DIREKTE TIL BILLETSYSTEMET (Billetten.dk):
+        page.goto(ticket_url, wait_until="networkidle", timeout=30000)
         
-        full_text = ""
-        # 4. Saml alt tekst fra skærmen (inklusive det indlejrede billetsystem)
-        for p in context.pages:
-            try:
-                full_text += " " + p.inner_text("body", timeout=2000)
-                for frame in p.frames:
-                    try:
-                        full_text += " " + frame.locator("body").inner_text(timeout=2000)
-                    except:
-                        pass
-            except:
-                pass
-                
+        # Vent 3 sekunder ekstra for at eventuelle asynkrone tekster i billetsystemet kan loade
+        page.wait_for_timeout(3000)
+        
+        # Læser al tekst på den nye side (billetsystemet)
+        full_text = page.inner_text("body")
         full_text = re.sub(r"\s+", " ", full_text).strip().lower()
         
     except Exception as e:
@@ -110,7 +96,7 @@ def check_once(state: dict, context) -> dict:
         
     page.close()
     
-    # 5. Analysér teksten
+    # 5. Analysér teksten FRA BILLETSYSTEMET
     no_tickets_phrase = "ingen resalebilletter tilgængeligt pt"
     
     if no_tickets_phrase in full_text:
@@ -121,8 +107,8 @@ def check_once(state: dict, context) -> dict:
         reason = "Positiv tekst fundet (fx 'billet ledig')."
     else:
         currently_available = True
-        reason = "Udsolgt-teksten er forsvundet! Mulig billet."
-        log(f"-> Robotten ser dette på skærmen (uddrag): {full_text[:300]}...")
+        reason = "Udsolgt-teksten er IKKE på billetsiden! Mulig billet."
+        log(f"-> Robotten ser dette på BILLETSIDEN (uddrag): {full_text[:300]}...")
         
     previous_available = state.get("available")
     
