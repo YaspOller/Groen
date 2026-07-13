@@ -6,21 +6,16 @@ import time
 import json
 from datetime import datetime, timezone
 import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
-TARGET_URL = "https://groenkoncert.dk/billetter/" 
 CITY = "Aarhus"
-ALL_CITIES = ["Tårnby", "Kolding", "Aarhus", "Aalborg", "Esbjerg", "Odense", "Næstved", "Valby"]
+TARGET_URL = "https://groenkoncert.dk/billetter/" 
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "data", "state.json")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-RUN_DURATION_SECONDS = 260
-CHECK_INTERVAL_SECONDS = 10
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Accept-Language": "da-DK,da;q=0.9,en;q=0.8",
-}
+RUN_DURATION_SECONDS = 260
+CHECK_INTERVAL_SECONDS = 30  # Tjekker hvert halve minut nu
 
 def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -32,61 +27,13 @@ def load_state() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (json.JSONDecodeError, OSError):
+    except:
         return {}
 
 def save_state(state: dict) -> None:
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
-
-def fetch_page() -> str:
-    resp = requests.get(TARGET_URL, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    return resp.text
-
-def normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip().lower()
-
-def extract_city_block(html: str, city: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    full_text = soup.get_text("\n")
-    lines = [l.strip() for l in full_text.split("\n") if l.strip()]
-
-    try:
-        start_marker = lines.index("Koncerter Billeter")
-    except ValueError:
-        start_marker = 0
-
-    section = lines[start_marker:]
-
-    try:
-        city_start = section.index(city)
-    except ValueError:
-        raise RuntimeError(f"Kunne ikke finde byen '{city}' på siden.")
-
-    city_end = len(section)
-    for other_city in ALL_CITIES:
-        if other_city == city:
-            continue
-        for idx in range(city_start + 1, len(section)):
-            if section[idx] == other_city:
-                city_end = min(city_end, idx)
-                break
-
-    return "\n".join(section[city_start:city_end])
-
-def check_tickets_status(city_block_text: str) -> dict:
-    full_text = normalize(city_block_text)
-    no_tickets_phrase = "ingen resalebilletter tilgængeligt pt"
-    
-    if no_tickets_phrase in full_text:
-        return {"available": False, "reason": f"Ingen billetter ('ingen resalebilletter tilgængeligt pt' fundet for {CITY})."}
-    
-    if "billet ledig" in full_text or "billetter ledig" in full_text or re.search(r"\b[1-9]\d*\s*billet", full_text):
-        return {"available": True, "reason": "Positiv tekst fundet (fx 'billet ledig')."}
-        
-    return {"available": True, "reason": f"Teksten 'ingen resalebilletter tilgængeligt pt.' er forsvundet for {CITY}!"}
 
 def send_discord_message(content: str) -> None:
     if not DISCORD_WEBHOOK_URL:
@@ -97,35 +44,93 @@ def send_discord_message(content: str) -> None:
     except Exception as e:
         log(f"Fejl ved Discord: {e}")
 
-def check_once(state: dict) -> dict:
+def check_once(state: dict, context) -> dict:
+    page = context.new_page()
     try:
-        html = fetch_page()
+        log(f"Åbner browser og tjekker {CITY}...")
+        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+        
+        # 1. Klik cookie-boks væk, hvis den er i vejen
+        try:
+            page.locator("button, a", has_text=re.compile(r"accepter|tillad", re.I)).first.click(timeout=2000)
+        except:
+            pass
+            
+        # 2. Find "Aarhus" på siden, og klik på den tilhørende billet-knap
+        page.evaluate('''() => {
+            let els = document.querySelectorAll("h2, h3, h4, span, div, p");
+            let aarhusEl = Array.from(els).find(e => e.innerText && e.innerText.trim() === "Aarhus");
+            if (aarhusEl) {
+                aarhusEl.click(); 
+                let parent = aarhusEl.parentElement;
+                while(parent && parent.tagName !== "BODY") {
+                    let btns = parent.querySelectorAll("a, button");
+                    for (let btn of btns) {
+                        let txt = btn.innerText.toLowerCase();
+                        if(txt.includes("resale") || txt.includes("venteliste") || txt.includes("køb")) {
+                            btn.click();
+                            return;
+                        }
+                    }
+                    parent = parent.parentElement;
+                }
+            }
+        }''')
+        
+        # 3. Vent 6 sekunder på at pop-up'en loader færdig
+        page.wait_for_timeout(6000) 
+        
+        full_text = ""
+        # 4. Saml tekst fra ALLE åbne vinduer og pop-ups for at være sikker
+        for p in context.pages:
+            try:
+                full_text += " " + p.inner_text("body")
+                for frame in p.frames:
+                    try:
+                        full_text += " " + frame.locator("body").inner_text()
+                    except:
+                        pass
+            except:
+                pass
+                
+        full_text = re.sub(r"\s+", " ", full_text).strip().lower()
+        
     except Exception as e:
-        log(f"Fejl: {e}")
+        log(f"Fejl under browser-tjek: {e}")
+        page.close()
         return state
-
-    try:
-        city_block = extract_city_block(html, CITY)
-    except RuntimeError as e:
-        log(str(e))
-        return state
-
-    status = check_tickets_status(city_block)
-    currently_available = status["available"]
-    reason = status["reason"]
+        
+    page.close()
+    
+    # 5. Analysér den tekst, som browseren kan se
+    no_tickets_phrase = "ingen resalebilletter tilgængeligt pt"
+    
+    if no_tickets_phrase in full_text:
+        currently_available = False
+        reason = "Ingen billetter (Udsolgt-tekst fundet)."
+    elif "billet ledig" in full_text or "billetter ledig" in full_text or re.search(r"\b[1-9]\d*\s*billet", full_text):
+        currently_available = True
+        reason = "Positiv tekst fundet (fx 'billet ledig')."
+    else:
+        currently_available = True
+        reason = f"Udsolgt-teksten er forsvundet! Mulig billet til {CITY}."
+        
     previous_available = state.get("available")
-
+    
     if previous_available is None:
         log(f"Første kørsel - gemmer status: {reason}")
         state["available"] = currently_available
         return state
 
+    # 6. Giv lyd hvis status ændrer sig!
     if currently_available and not previous_available:
         msg = f"🎟️ **BILLETTER TILGÆNGELIGE TIL {CITY.upper()}!** 🎟️\n**Årsag:** {reason}\nKøb her: {TARGET_URL}"
         send_discord_message(msg)
     elif not currently_available and previous_available:
         send_discord_message(f"ℹ️ Billetter til **{CITY}** er væk igen. ({reason})")
-
+    else:
+        log(f"Status uændret: {reason}")
+        
     state["available"] = currently_available
     return state
 
@@ -133,12 +138,23 @@ def main():
     state = load_state()
     start_time = time.monotonic()
     
-    while True:
-        state = check_once(state)
-        save_state(state)
-        if (time.monotonic() - start_time) + CHECK_INTERVAL_SECONDS >= RUN_DURATION_SECONDS:
-            break
-        time.sleep(CHECK_INTERVAL_SECONDS)
+    # Starter den usynlige browser én gang
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            locale="da-DK"
+        )
+        
+        # Kører i loop til GitHub-kørslen udløber
+        while True:
+            state = check_once(state, context)
+            save_state(state)
+            if (time.monotonic() - start_time) + CHECK_INTERVAL_SECONDS >= RUN_DURATION_SECONDS:
+                break
+            time.sleep(CHECK_INTERVAL_SECONDS)
+            
+        browser.close()
 
 if __name__ == "__main__":
     main()
